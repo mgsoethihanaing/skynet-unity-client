@@ -14,6 +14,7 @@ namespace SkynetUnity
     /// <summary>
     /// Low-level TCP transport implementing Skynet binary protocol.
     /// Thread-safe. Uses ArrayPool for zero-allocation sends.
+    /// Pure transport layer - no game logic.
     /// </summary>
     public class SkynetTransport : IDisposable
     {
@@ -29,43 +30,21 @@ namespace SkynetUnity
         private readonly byte[] _headerBuffer = new byte[2];
         private readonly byte[] _readBuffer = new byte[65535];
 
-        // Health Tracking (thread-safe via Interlocked)
-        private long _lastPongTicks;
-        
-        /// <summary>
-        /// Timestamp (ticks) of last received PONG packet.
-        /// Thread-safe for watchdog checks.
-        /// </summary>
-        public long LastPongTicks => Interlocked.Read(ref _lastPongTicks);
-        
         /// <summary>
         /// Best-effort connection status check.
-        /// Note: TCP state is unreliable; rely on watchdog for true liveness.
+        /// Note: TCP state is unreliable; use application-level heartbeat for true liveness.
         /// </summary>
-        public bool IsConnected => 
-            _isDisposed == 0 && 
-            _client != null && 
-            _client.Connected && 
-            _stream != null && 
+        public bool IsConnected =>
+            _isDisposed == 0 &&
+            _client != null &&
+            _client.Connected &&
+            _stream != null &&
             _stream.CanRead;
 
         // Events (invoked on background threads - marshal to main thread if needed)
         public event Action<ushort, string> OnPacketReceived;
         public event Action<string> OnError;
         public event Action OnDisconnected;
-
-        public SkynetTransport()
-        {
-            UpdateLastPong();
-        }
-
-        /// <summary>
-        /// Update last pong timestamp. Thread-safe.
-        /// </summary>
-        public void UpdateLastPong()
-        {
-            Interlocked.Exchange(ref _lastPongTicks, DateTime.UtcNow.Ticks);
-        }
 
         /// <summary>
         /// Connect to Skynet server with timeout.
@@ -74,7 +53,7 @@ namespace SkynetUnity
         public async Task ConnectAsync(string ip, int port, int timeoutMs = 5000)
         {
             if (IsConnected) return;
-            
+
             // Clean up any previous connection
             Dispose();
             _isDisposed = 0;
@@ -104,8 +83,6 @@ namespace SkynetUnity
 
                 _stream = _client.GetStream();
                 _readCts = new CancellationTokenSource();
-                
-                UpdateLastPong();
 
                 // Start read loop on background thread
                 _ = Task.Run(() => ReadLoopAsync(_readCts.Token), _readCts.Token);
@@ -128,7 +105,7 @@ namespace SkynetUnity
             // Calculate exact size needed
             int bodyByteCount = Encoding.UTF8.GetByteCount(message);
             int totalLen = 4 + bodyByteCount; // Header(2) + Cmd(2) + Body
-            
+
             byte[] buffer = ArrayPool<byte>.Shared.Rent(totalLen);
 
             try
@@ -137,7 +114,7 @@ namespace SkynetUnity
                 ushort payloadLen = (ushort)(2 + bodyByteCount);
                 buffer[0] = (byte)(payloadLen >> 8);
                 buffer[1] = (byte)(payloadLen & 0xFF);
-                
+
                 // Encode command
                 ushort cmd = (ushort)op;
                 buffer[2] = (byte)(cmd >> 8);
@@ -150,7 +127,7 @@ namespace SkynetUnity
                 try
                 {
                     if (!IsConnected) return;
-                    
+
                     // TCP auto-flushes on write
                     await _stream.WriteAsync(buffer, 0, totalLen).ConfigureAwait(false);
                 }
@@ -201,9 +178,9 @@ namespace SkynetUnity
 
                     // Parse command
                     ushort cmdId = (ushort)((_readBuffer[0] << 8) | _readBuffer[1]);
-                    
+
                     // Only allocate string if there's body content
-                    string body = payloadLen > 2 
+                    string body = payloadLen > 2
                         ? Encoding.UTF8.GetString(_readBuffer, 2, payloadLen - 2)
                         : string.Empty;
 
@@ -238,12 +215,12 @@ namespace SkynetUnity
             while (totalRead < count)
             {
                 if (!IsConnected) return false;
-                
+
                 int bytesRead = await _stream.ReadAsync(buffer, offset + totalRead, count - totalRead, token)
                     .ConfigureAwait(false);
-                
+
                 if (bytesRead == 0) return false; // Connection closed
-                
+
                 totalRead += bytesRead;
             }
             return true;
@@ -261,12 +238,12 @@ namespace SkynetUnity
             {
                 // Cancel first to signal all async operations
                 _readCts?.Cancel();
-                
+
                 // Dispose in correct order: Stream → Client → CancellationTokenSource
                 try { _stream?.Dispose(); } catch { }
                 try { _client?.Dispose(); } catch { }
                 _readCts?.Dispose();
-                
+
                 // Do NOT dispose _writeLock - let GC handle it to avoid races
             }
             catch { /* Suppress cleanup errors */ }
