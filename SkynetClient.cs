@@ -1,7 +1,7 @@
 // SkynetClient.cs
 // Unity MonoBehaviour wrapper for SkynetTransport
 // Handles reconnection and main-thread marshalling
-// Does NOT implement game logic (ping/pong, watchdog, etc.)
+// Does NOT auto-connect - user must call Connect() manually
 
 using System;
 using System.Collections.Concurrent;
@@ -13,8 +13,8 @@ namespace SkynetUnity
 {
     /// <summary>
     /// Unity client for Skynet protocol.
-    /// Auto-reconnects and marshals packets to main thread.
-    /// Pure infrastructure - no game logic.
+    /// Marshals packets to main thread and handles reconnection.
+    /// Call Connect() manually to start connection.
     /// </summary>
     public class SkynetClient : MonoBehaviour
     {
@@ -23,6 +23,9 @@ namespace SkynetUnity
         [SerializeField] private int _port = 10000;
 
         [Header("Reconnection")]
+        [Tooltip("Enable automatic reconnection on disconnect")]
+        [SerializeField] private bool _autoReconnect = true;
+
         [Tooltip("Initial retry delay in milliseconds")]
         [SerializeField] private int _initialRetryDelayMs = 1000;
 
@@ -30,10 +33,10 @@ namespace SkynetUnity
         [SerializeField] private int _maxRetryDelayMs = 10000;
 
         private SkynetTransport _transport;
-        private CancellationTokenSource _lifetimeCts;
+        private CancellationTokenSource _connectionCts;
         private readonly ConcurrentQueue<Action> _mainThreadQueue = new ConcurrentQueue<Action>();
 
-        private bool _isIntentionallyConnected;
+        private bool _isManuallyConnecting;
         private int _reconnectAttempts;
 
         /// <summary>
@@ -57,31 +60,55 @@ namespace SkynetUnity
         /// </summary>
         public event Action<OpCode, string> OnPacketEvent;
 
-        private void Start()
+        private void Awake()
         {
-            _lifetimeCts = new CancellationTokenSource();
             _transport = new SkynetTransport();
 
             // Bind events (invoked on background threads)
             _transport.OnPacketReceived += HandlePacketBackground;
             _transport.OnError += (msg) => Enqueue(() => Debug.LogError($"[Skynet] {msg}"));
             _transport.OnDisconnected += () => Enqueue(OnDisconnected);
+        }
 
-            _isIntentionallyConnected = true;
+        /// <summary>
+        /// Manually connect to server.
+        /// Safe to call multiple times.
+        /// </summary>
+        public void Connect()
+        {
+            Connect(_ip, _port);
+        }
+
+        /// <summary>
+        /// Manually connect to server with custom IP/port.
+        /// Safe to call multiple times.
+        /// </summary>
+        public void Connect(string ip, int port)
+        {
+            if (_isManuallyConnecting) return;
+
+            _ip = ip;
+            _port = port;
+            _isManuallyConnecting = true;
+
+            // Cancel any existing connection attempt
+            _connectionCts?.Cancel();
+            _connectionCts?.Dispose();
+            _connectionCts = new CancellationTokenSource();
 
             // Start connection loop
-            ConnectLoop(_lifetimeCts.Token).SafeFireAndForget();
+            ConnectLoop(_connectionCts.Token).SafeFireAndForget();
         }
 
         /// <summary>
         /// Connection/reconnection loop.
-        /// Runs until GameObject is destroyed.
+        /// Runs until Disconnect() is called or GameObject is destroyed.
         /// </summary>
         private async Task ConnectLoop(CancellationToken token)
         {
             int retryDelay = _initialRetryDelayMs;
 
-            while (!token.IsCancellationRequested && _isIntentionallyConnected)
+            while (!token.IsCancellationRequested && _isManuallyConnecting)
             {
                 try
                 {
@@ -107,6 +134,14 @@ namespace SkynetUnity
                 {
                     _reconnectAttempts++;
                     Debug.LogWarning($"[Skynet] Connection failed: {e.Message}. Retrying in {retryDelay}ms...");
+
+                    // If auto-reconnect is disabled and first attempt failed, stop
+                    if (!_autoReconnect && _reconnectAttempts > 0)
+                    {
+                        Debug.LogError("[Skynet] Auto-reconnect disabled. Stopping.");
+                        _isManuallyConnecting = false;
+                        break;
+                    }
 
                     try
                     {
@@ -137,6 +172,12 @@ namespace SkynetUnity
         {
             Debug.LogWarning("[Skynet] Disconnected");
             OnDisconnectedEvent?.Invoke();
+
+            // If auto-reconnect is disabled, stop trying
+            if (!_autoReconnect)
+            {
+                _isManuallyConnecting = false;
+            }
         }
 
         /// <summary>
@@ -165,8 +206,11 @@ namespace SkynetUnity
         /// </summary>
         public void Disconnect()
         {
-            _isIntentionallyConnected = false;
+            _isManuallyConnecting = false;
+            _connectionCts?.Cancel();
             _transport?.Dispose();
+
+            Debug.Log("[Skynet] Manually disconnected");
         }
 
         private void Enqueue(Action action) => _mainThreadQueue.Enqueue(action);
@@ -193,11 +237,11 @@ namespace SkynetUnity
 
         private void OnDestroy()
         {
-            _isIntentionallyConnected = false;
-            _lifetimeCts?.Cancel();
+            _isManuallyConnecting = false;
+            _connectionCts?.Cancel();
 
             _transport?.Dispose();
-            _lifetimeCts?.Dispose();
+            _connectionCts?.Dispose();
         }
 
         private void OnApplicationQuit()
